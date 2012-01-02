@@ -29,6 +29,7 @@
 #define __USE_GNU
 #include <string.h>
 #include <unistd.h>
+#include <gst/gst.h>
 #include "types.h"
 #include "browser.h"
 #include "cfg.h"
@@ -95,24 +96,20 @@ pthread_t player_tid = 0;
 /* Player termination flag */
 volatile bool_t player_end_thread = FALSE;
 
-/* Timer thread ID */
-pthread_t player_timer_tid = 0;
-
 /* Timer termination flag */
-volatile bool_t player_end_timer = FALSE;
 volatile bool_t player_end_track = FALSE;
 
 /* Player context */
 player_context_t *player_context = NULL;
+
+bool_t player_end_of_stream = FALSE;
+GstElement *player_pipeline = NULL;
 
 /* Has equalizer value changed */
 bool_t player_eq_changed = FALSE;
 
 /* Edit boxes history lists */
 editbox_history_t *player_hist_lists[PLAYER_NUM_HIST_LISTS];
-
-/* Current input plugin */
-in_plugin_t *player_inp = NULL;
 
 /* Undo list */
 undo_list_t *player_ul = NULL;
@@ -172,10 +169,6 @@ int num_queued_songs = 0;
 
 /* Main thread ID */
 pthread_t player_main_tid = 0; 
-
-/* Output plugin used to play current song (this is not the same as
- * pmng->m_cur_out */
-out_plugin_t *player_cur_outp = NULL;
 
 /*****
  *
@@ -432,7 +425,6 @@ void player_root_destructor( wnd_t *wnd )
 	logger_debug(player_log, "Doing irw_free");
 	irw_free();
 	logger_debug(player_log, "Setting next song to NULL");
-	inp_set_next_song(player_inp, NULL);
 	if (player_tid)
 	{
 		logger_debug(player_log, "Stopping player thread");
@@ -855,14 +847,11 @@ wnd_msg_retcode_t player_on_action( wnd_t *wnd, char *action, int repval )
 	/* Resume playing */
 	else if (!strcasecmp(action, "play"))
 	{
-		if (player_context->m_status == PLAYER_STATUS_PAUSED)
-		{
-			player_pause_resume();
-		}
-		else
-		{
-			player_start_play(player_plist->m_cur_song, 0);
-		}
+		if (player_context->m_status != PLAYER_STATUS_PAUSED)
+			player_play(player_plist->m_cur_song, 0);
+		player_context->m_status = PLAYER_STATUS_PLAYING;
+
+		pmng_hook(player_pmng, "player-status");
 	}
 	/* Pause */
 	else if (!strcasecmp(action, "pause"))
@@ -1293,7 +1282,9 @@ wnd_msg_retcode_t player_on_command( wnd_t *wnd, char *cmd,
 			right = 0;
 		else if (right > 100)
 			right = 100;
+#if 0
 		outp_set_volume(player_cur_outp, left, right);
+#endif
 		player_read_volume();
 	}
 	/* Simulate an action */
@@ -1480,6 +1471,7 @@ void player_seek( int sec, bool_t rel )
 {
 	song_t *s;
 	int new_time;
+	guint64 tm;
 	
 	if (player_plist->m_cur_song == -1)
 		return;
@@ -1493,7 +1485,13 @@ void player_seek( int sec, bool_t rel )
 		new_time = s->m_len;
 
 	player_save_time();
-	inp_seek(song_get_inp(s, NULL), player_translate_time(s, new_time, TRUE));
+	tm = (guint64)player_translate_time(s, new_time, TRUE) * 1000000000;
+	logger_debug(player_log, "gstreamer: seeking to time %lld", tm);
+	if (!gst_element_seek(player_pipeline, 1.0, GST_FORMAT_TIME, GST_SEEK_FLAG_FLUSH,
+			GST_SEEK_TYPE_SET, tm, GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE))
+	{
+		logger_error(player_log, 1, "gstreamer: gst_element_seek returned FALSE");
+	}
 	player_context->m_cur_time = new_time;
 	wnd_invalidate(player_wnd);
 	logger_debug(player_log, "after player_seek timer is %d", player_context->m_cur_time);
@@ -1543,12 +1541,12 @@ void player_end_play( bool_t rem_cur_song )
 	int was_song = player_plist->m_cur_song;
 	
 	player_save_time();
+#if 0
 	outp_resume(player_cur_outp);
+#endif
 	player_plist->m_cur_song = -1;
 	player_end_track = TRUE;
 //	player_context->m_status = PLAYER_STATUS_STOPPED;
-	while (player_timer_tid)
-		util_wait();
 	if (!rem_cur_song)
 		player_plist->m_cur_song = was_song;
 	cfg_set_var(cfg_list, "cur-song-name", "");
@@ -1561,8 +1559,10 @@ void player_next_track( void )
 	int next_track;
 	
 	next_track = player_skip_songs(1, FALSE);
+	/*
 	inp_set_next_song(player_inp, next_track >= 0 ?
 		player_plist->m_list[next_track]->m_file_name : NULL);
+		*/
 	player_set_track(next_track);
 } /* End of 'player_next_track' function */
 
@@ -1713,76 +1713,6 @@ int player_skip_songs( int num, bool_t play )
 	return song;
 } /* End of 'player_skip_songs' function */
 
-/* Stop timer thread */
-void player_stop_timer( void )
-{
-	if (player_timer_tid != 0)
-	{
-		player_end_timer = TRUE;
-		pthread_join(player_timer_tid, NULL);
-		logger_debug(player_log, "Timer thread terminated");
-		player_end_timer = FALSE;
-		player_timer_tid = 0;
-		player_context->m_cur_time = 0;
-	}
-} /* End of 'player_stop_timer' function */
-
-/* Timer thread function */
-void *player_timer_func( void *arg )
-{
-	time_t t = time(NULL);
-	song_t *s = (song_t *)arg;
-
-	/* Start zero timer count */
-//	player_context->m_cur_time = 0;
-
-	/* Timer loop */
-	while (!player_end_timer)
-	{
-		time_t new_t = time(NULL);
-		struct timespec tv;
-		int tm;
-
-		/* Update timer */
-		if (player_context->m_status == PLAYER_STATUS_PAUSED)
-		{
-			t = new_t;
-		}
-		else
-		{	
-			tm = inp_get_cur_time(player_inp);
-			if (tm < 0)
-			{
-				if (new_t > t)
-				{
-					player_context->m_cur_time += (new_t - t);
-					t = new_t;
-					logger_debug(player_log, "get_cur_time failed. setting time to %d", 
-							player_context->m_cur_time);
-					pmng_hook(player_pmng, "player-time");
-					wnd_invalidate(player_wnd);
-				}
-			}
-			else 
-			{
-				tm = player_translate_time(s, tm, FALSE);
-				if (tm - player_context->m_cur_time)
-				{
-					player_context->m_cur_time = tm;
-					pmng_hook(player_pmng, "player-time");
-					wnd_invalidate(player_wnd);
-				}
-			}
-		}
-		util_wait();
-	}
-
-	player_context->m_cur_time = 0;
-	player_end_timer = FALSE;
-	player_timer_tid = 0;
-	return NULL;
-} /* End of 'player_timer_func' function */
-
 /* Translate projected song time to real time */
 int player_translate_time( song_t *s, int t, bool_t virtual2real )
 {
@@ -1791,11 +1721,77 @@ int player_translate_time( song_t *s, int t, bool_t virtual2real )
 	return (virtual2real ? s->m_start_time + t : t - s->m_start_time);
 } /* End of 'player_translate_time' function */
 
+/* GStreamer bus message handler */
+static gboolean player_gst_bus_call( GstBus *bus, GstMessage *msg, gpointer data )
+{
+	gchar *debug;
+	GError *error;
+
+	switch (GST_MESSAGE_TYPE(msg))
+	{
+	case GST_MESSAGE_EOS:
+		logger_debug(player_log, "gstreamer: EOS message arrived");
+		player_end_of_stream = TRUE;
+		break;
+	case GST_MESSAGE_ERROR:
+		gst_message_parse_error(msg, &error, &debug);
+		g_free(debug);
+
+		logger_error(player_log, 1, "gstreamer error: %s", error->message);
+		g_error_free(error);
+		break;
+	}
+
+	return TRUE;
+}
+
+/* Player thread function */
+bool_t player_set_audio_sink( void )
+{
+	char *audio_sink_name = cfg_get_var(cfg_list, "gstreamer.audio-sink");
+	if (audio_sink_name)
+	{
+		GstElement *sink = gst_element_factory_make(audio_sink_name, "sink");
+		if (sink)
+		{
+			cfg_node_t *cfg_node = cfg_search_node(cfg_list, "gstreamer.audio-sink-params");
+			if (cfg_node)
+			{
+				cfg_list_iterator_t iter = cfg_list_begin_iteration(cfg_node);
+				for ( ;; )
+				{
+					cfg_node_t *cfg_node = cfg_list_iterate(&iter);
+					if (!cfg_node)
+						break;
+
+					if (CFG_NODE_IS_VAR(cfg_node))
+					{
+						char *name = cfg_node->m_name;
+						char *val = CFG_VAR_VALUE(cfg_node);
+
+						logger_debug(player_log, "gstreamer: setting audio sink param %s to %s",
+								name, val);
+						g_object_set(G_OBJECT(sink), name, val, NULL);
+					}
+				}
+			}
+			logger_debug(player_log, "gstreamer: setting audio sink to %s", audio_sink_name);
+			g_object_set(G_OBJECT(player_pipeline), "audio-sink", sink, NULL);
+		}
+		else
+		{
+			logger_error(player_log, 1, _("Audio sink %s could not be created"), 
+					audio_sink_name);
+			return FALSE;
+		}
+	}
+
+	return TRUE;
+}
+
 /* Player thread function */
 void *player_thread( void *arg )
 {
-	bool_t no_outp = FALSE;
-	
 	logger_debug(player_log, "In player_thread");
 
 	/* Main loop */
@@ -1805,16 +1801,14 @@ void *player_thread( void *arg )
 		int ch = 0, freq = 0, real_ch = 0, real_freq = 0;
 		dword fmt = 0, real_fmt = 0;
 		song_info_t si;
-		in_plugin_t *inp;
 		int was_pfreq, was_pbr, was_pstereo;
 		int disp_count;
 		dword in_flags, out_flags;
-		file_t *fd = NULL;
-		struct x_convert_buffers *convert_buf;
-		convert_func_t fmt_convert_func;
-		convert_channel_func_t chan_convert_func;
-		convert_freq_func_t freq_convert_func;
 		bool_t song_finished;
+		GMainLoop *loop = NULL;
+		GstBus *bus = NULL;
+		int was_status;
+		char *uri = NULL;
 
 		/* Skip to next iteration if there is nothing to play */
 		if (player_plist->m_cur_song < 0 || 
@@ -1832,34 +1826,12 @@ void *player_thread( void *arg )
 	
 		logger_debug(player_log, "Playing track %s", s->m_full_name);
 
-		/* Start playing */
-		logger_debug(player_log, "Starting input plugin");
-		inp = song_get_inp(s, &fd);
-		if (!inp_start(inp, song_played->m_file_name, fd))
-		{
-			player_next_track();
-			logger_error(player_log, 0,
-					_("Input plugin for file %s failed"), song_played->m_file_name);
-			wnd_invalidate(player_wnd);
-			continue;
-		}
-		logger_debug(player_log, "start time is %d", song_played->m_start_time);
-		if (player_context->m_cur_time > 0 || song_played->m_start_time > -1)
-			inp_seek(inp, player_translate_time(song_played, player_context->m_cur_time, TRUE));
-		in_flags = inp_get_flags(inp);
-		out_flags = outp_get_flags(player_pmng->m_cur_out);
-		no_outp = (in_flags & INP_OWN_OUT) || 
-			((in_flags & INP_OWN_SOUND) && !(out_flags & OUTP_NO_SOUND));
-
-		/* Set proper mixer type */
-		logger_debug(player_log, "Setting mixer type");
-		outp_set_mixer_type(player_pmng->m_cur_out, inp_get_mixer_type(inp));
-
 		/* Get song length and information */
 		logger_debug(player_log, "Updating song info");
 		song_update_info(s);
 
 		/* Start output plugin */
+		/*
 		logger_debug(player_log, "Starting output plugin");
 		if (!no_outp && (player_pmng->m_cur_out == NULL || 
 				(!cfg_get_var_int(cfg_list, "silent-mode") && 
@@ -1873,174 +1845,156 @@ void *player_thread( void *arg )
 			wnd_invalidate(player_wnd);
 			continue;
 		}
-		player_cur_outp = player_pmng->m_cur_out;
+		*/
 
-		/* Set audio parameters */
-		/*if (!no_outp)
+		/* Create gstreamer stuff */
+		player_end_of_stream = FALSE;
+		loop = g_main_loop_new(NULL, FALSE);
+		if (!loop)
 		{
-			outp_set_channels(player_pmng->m_cur_out, 2);
-			outp_set_freq(player_pmng->m_cur_out, freq);
-			outp_set_fmt(player_pmng->m_cur_out, fmt);
-		}*/
+			logger_error(player_log, 1, "g_main_loop_new failed");
+			goto cleanup;
+		}
+		player_pipeline = gst_element_factory_make("playbin", "play");
+		if (!player_pipeline)
+		{
+			logger_error(player_log, 1, "gstreamer: unable to create playbin");
+			goto cleanup;
+		}
 
-		/* Create buffers for converting audio */
-		convert_buf = x_convert_buffers_new();
+		/* Set a user-specified audio sink */
+		if (!player_set_audio_sink())
+		{
+			goto cleanup;
+		}
 
-		/* Save current input plugin */
-		player_inp = inp;
+		/* Set bus message handler */
+		bus = gst_pipeline_get_bus(GST_PIPELINE(player_pipeline));
+		if (!bus)
+		{
+			logger_error(player_log, 1, "gst_pipeline_get_bus failed");
+		}
+		gst_bus_add_watch(bus, player_gst_bus_call, NULL);
+		gst_object_unref(bus);
 
-		/* Set equalizer */
-		inp_set_eq(inp);
+		/* Make an URI for playbin */
+		uri = util_strcat("file://", song_played->m_full_name, NULL);
+		g_object_set(G_OBJECT(player_pipeline), "uri", uri, NULL);
+		free(uri);
 
-		/* Start timer thread */
-		logger_debug(player_log, "Creating timer thread");
-		pthread_create(&player_timer_tid, NULL, player_timer_func, song_played);
-		//wnd_send_msg(wnd_root, WND_MSG_DISPLAY, 0);
-	
+		/* Start playing */
+		gst_element_set_state(player_pipeline, GST_STATE_PLAYING);
+		gst_element_get_state(player_pipeline, NULL, NULL, GST_CLOCK_TIME_NONE);
+
+		/* Seek to start time */
+		logger_debug(player_log, "start time is %d", song_played->m_start_time);
+		logger_debug(player_log, "cur_time is %d", player_context->m_cur_time);
+		if (player_context->m_cur_time > 0 || song_played->m_start_time > -1)
+		{
+			guint64 tm = (guint64)player_translate_time(song_played, player_context->m_cur_time, TRUE) * 1000000000;
+			logger_debug(player_log, "gstreamer: seeking to time %lld", tm);
+			if (!gst_element_seek(player_pipeline, 1.0, GST_FORMAT_TIME, GST_SEEK_FLAG_FLUSH,
+					GST_SEEK_TYPE_SET, tm, GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE))
+			{
+				logger_error(player_log, 1, "gstreamer: gst_element_seek returned FALSE");
+			}
+		}
+
 		/* Play */
 		disp_count = 0;
 		logger_debug(player_log, "Going into track playing cycle");
 		song_finished = FALSE;
+		was_status = PLAYER_STATUS_PLAYING;
 		while (!player_end_track)
 		{
-			byte buf[8192], *data = buf;
-			int size = 8192;
-			struct timespec tv;
+			g_main_context_iteration(NULL, FALSE);
+
+			if (player_context->m_status != was_status)
+			{
+				switch (player_context->m_status)
+				{
+				case PLAYER_STATUS_PLAYING:
+					gst_element_set_state(player_pipeline, GST_STATE_PLAYING);
+					break;
+				case PLAYER_STATUS_PAUSED:
+					gst_element_set_state(player_pipeline, GST_STATE_PAUSED);
+					break;
+				case PLAYER_STATUS_STOPPED:
+					gst_element_set_state(player_pipeline, GST_STATE_READY);
+					break;
+				}
+			}
 
 			if (player_context->m_status == PLAYER_STATUS_PLAYING)
 			{
-				/* Update equalizer if it's parameters have changed */
-				if (player_eq_changed)
+				GstFormat fmt = GST_FORMAT_TIME;
+				guint64 tm;
+
+				/* Update time */
+				if (gst_element_query_position(player_pipeline, &fmt, &tm))
 				{
-					player_eq_changed = FALSE;
-					inp_set_eq(inp);
-				}
-				
-				/* Get stream from input plugin */
-				logger_debug(player_log, "calling inp_get_stream(%d)", size);
-				if (size = inp_get_stream(inp, buf, size))
-				{
-					int new_ch, new_freq, new_br;
-					dword new_fmt;
-					
-					/* Get audio parameters */
-					inp_get_audio_params(inp, &new_ch, &new_freq, &new_fmt, 
-							&new_br);
-					was_pfreq = player_context->m_freq; was_pstereo = player_context->m_stereo;
-					was_pbr = player_context->m_bitrate;
-					player_context->m_freq = new_freq;
-					player_context->m_stereo = (new_ch == 1) ? PLAYER_MONO : PLAYER_STEREO;
-					new_br /= 1000;
-					player_context->m_bitrate = new_br;
-					if ((player_context->m_freq != was_pfreq || 
-							player_context->m_stereo != was_pstereo ||
-							player_context->m_bitrate != was_pbr) && !disp_count)
+					tm /= 1000000000;
+					tm = player_translate_time(song_played, tm, FALSE);
+					if (tm - player_context->m_cur_time)
 					{
-						disp_count = cfg_get_var_int(cfg_list, 
-								"audio-params-display-count");
-						if (!disp_count)
-							disp_count = 20;
+						player_context->m_cur_time = tm;
+						pmng_hook(player_pmng, "player-time");
 						wnd_invalidate(player_wnd);
 					}
-					disp_count --;
-					if (disp_count < 0)
-						disp_count = 0;
-
-					/* Update audio parameters if they have changed */
-					if (!no_outp)
-					{
-						if (ch != new_ch || freq != new_freq || fmt != new_fmt)
-						{
-							ch = new_ch;
-							freq = new_freq;
-							fmt = new_fmt;
-						
-							outp_flush(player_cur_outp);
-							outp_set_channels(player_cur_outp, ch);
-							outp_set_freq(player_cur_outp, freq);
-							outp_set_fmt(player_cur_outp, fmt);
-
-							/* Set conversion functions */
-							fmt_convert_func = NULL;
-							chan_convert_func = NULL;
-							freq_convert_func = NULL;
-							real_fmt = outp_get_fmt(player_cur_outp);
-							if (real_fmt != 0xFFFFFFFF && real_fmt != fmt)
-								fmt_convert_func = x_convert_get_func(real_fmt, fmt);
-							real_ch = outp_get_channels(player_cur_outp);
-							if (real_ch >= 0 && real_ch != ch)
-								chan_convert_func = x_convert_get_channel_func(real_fmt,
-										real_ch, ch);
-							real_freq = outp_get_freq(player_cur_outp);
-							if (real_freq >= 0 && real_freq != freq)
-								freq_convert_func = 
-									x_convert_get_frequency_func(real_fmt, real_ch);
-
-							logger_debug(player_log, "ch = %d, fmt = %d, freq = %d", 
-									ch, fmt, freq);
-							logger_debug(player_log, "real ch = %d, fmt = %d, freq = %d", 
-									real_ch, real_fmt, real_freq);
-						}
-
-						/* Apply effects */
-						size = pmng_apply_effects(player_pmng, data, size, 
-								fmt, freq, ch);
-
-						/* Convert audio */
-						if (fmt_convert_func != NULL)
-							size = fmt_convert_func(convert_buf, (void **)(&data), size);
-						if (chan_convert_func != NULL)
-							size = chan_convert_func(convert_buf, (void **)(&data), size);
-						if (freq_convert_func != NULL)
-						{
-							size = freq_convert_func(convert_buf, (void **)(&data), size,
-									freq, real_freq);
-						}
-					
-						/* Send to output plugin */
-						outp_play(player_cur_outp, data, size);
-
-						/* Check for end of projected song */
-						if (song_played->m_end_time > -1 && 
-								player_translate_time(song_played, player_context->m_cur_time, TRUE) >= 
-								song_played->m_end_time)
-						{
-							logger_debug(player_log, "stopping at time %d(%d).", 
-									player_context->m_cur_time,
-									player_translate_time(song_played, player_context->m_cur_time, TRUE));
-							song_finished = TRUE;
-							break;
-						}
-					}
-					else
-						util_wait();
 				}
-				else
+
+				/* Get audio parameters */
+#if 0
+				inp_get_audio_params(inp, &new_ch, &new_freq, &new_fmt, 
+						&new_br);
+				was_pfreq = player_context->m_freq; was_pstereo = player_context->m_stereo;
+				was_pbr = player_context->m_bitrate;
+				player_context->m_freq = new_freq;
+				player_context->m_stereo = (new_ch == 1) ? PLAYER_MONO : player_context->m_stereo;
+				new_br /= 1000;
+				player_context->m_bitrate = new_br;
+				if ((player_context->m_freq != was_pfreq || 
+						player_context->m_stereo != was_pstereo ||
+						player_context->m_bitrate != was_pbr) && !disp_count)
 				{
+					disp_count = cfg_get_var_int(cfg_list, 
+							"audio-params-display-count");
+					if (!disp_count)
+						disp_count = 20;
+					wnd_invalidate(player_wnd);
+				}
+				disp_count --;
+				if (disp_count < 0)
+					disp_count = 0;
+#endif
+
+				/* Check for end of projected song */
+				if (song_played->m_end_time > -1 && 
+						player_translate_time(song_played, player_context->m_cur_time, TRUE) >= 
+						song_played->m_end_time)
+				{
+					logger_debug(player_log, "stopping at time %d(%d) with end_time=%d.", 
+							player_context->m_cur_time,
+							player_translate_time(song_played, player_context->m_cur_time, TRUE),
+							song_played->m_end_time);
 					song_finished = TRUE;
 					break;
 				}
 			}
-			else if (player_context->m_status == PLAYER_STATUS_PAUSED)
+
+			if (player_end_of_stream)
 			{
-				util_wait();
+				player_end_of_stream = FALSE;
+				song_finished = TRUE;
+				break;
 			}
+
+			was_status = player_context->m_status;
+			util_wait();
 		}
 		logger_debug(player_log, "End playing track");
 
-		/* Free convert buffers */
-		x_convert_buffers_destroy(convert_buf);
-
-		/* Wait until we really stop playing */
-		if (!no_outp && song_finished)
-		{
-			logger_debug(player_log, "outp_flush");
-			outp_flush(player_cur_outp);
-		}
-
-		/* Stop timer thread */
-		logger_debug(player_log, "Stopping timer");
-		player_stop_timer();
+		gst_element_set_state(player_pipeline, GST_STATE_NULL);
 
 		/* Send message about track end */
 		if (!player_end_track)
@@ -2050,21 +2004,22 @@ void *player_thread( void *arg )
 		}
 
 		/* End playing */
-		logger_debug(player_log, "inp_end");
-		inp_end(inp);
-		player_inp = NULL;
 		player_context->m_bitrate = player_context->m_freq = player_context->m_stereo = 0;
-
-		/* End output plugin */
-		if (!no_outp)
-		{
-			logger_debug(player_log, "outp_end");
-			outp_end(player_cur_outp);
-		}
-		player_cur_outp = NULL;
 
 		/* Update screen */
 		wnd_invalidate(player_wnd);
+
+	cleanup:
+		if (player_pipeline)
+		{
+			gst_object_unref(GST_OBJECT(player_pipeline));
+			player_pipeline = NULL;
+		}
+		if (loop)
+		{
+			g_main_loop_unref(loop);
+			loop = NULL;
+		}
 	}
 	logger_debug(player_log, "Player thread finished");
 	return NULL;
@@ -3499,14 +3454,10 @@ void player_pause_resume( void )
 	if (player_context->m_status == PLAYER_STATUS_PLAYING)
 	{
 		player_context->m_status = PLAYER_STATUS_PAUSED;
-		inp_pause(player_inp);
-		outp_pause(player_cur_outp);
 	}
 	else if (player_context->m_status == PLAYER_STATUS_PAUSED)
 	{
 		player_context->m_status = PLAYER_STATUS_PLAYING;
-		inp_resume(player_inp);
-		outp_resume(player_cur_outp);
 	}
 
 	pmng_hook(player_pmng, "player-status");
