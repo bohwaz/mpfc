@@ -838,6 +838,13 @@ static void plist_add_playlist_item( void *ctxv, char *name, song_metadata_t *me
 {
 	plist_cb_ctx_t *ctx = (plist_cb_ctx_t *)ctxv;
 
+	/* Handle URI in a playlist */
+	if (fu_is_prefixed(name))
+	{
+		ctx->num_added += plist_add_uri(ctx->pl, name);
+		return;
+	}
+
 	/* Get full path relative to the play list if it is not absolute */
 	char *full_name = name;
 	if ((*name) != '/')
@@ -1045,7 +1052,7 @@ static int plist_add_dir( plist_t *pl, char *dir_path )
 	return num_added;
 }
 
-static int plist_add_uri( plist_t *pl, char *uri )
+int plist_add_uri( plist_t *pl, char *uri )
 {
 	song_metadata_t metadata = SONG_METADATA_EMPTY;
 	song_t *s = song_new_from_uri(uri, &metadata);
